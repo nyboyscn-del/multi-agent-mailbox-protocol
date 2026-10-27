@@ -5,8 +5,11 @@ From: <requester role>
 To: <executor role>
 Created: <ISO-8601 with timezone>
 Scope: <what the executor may read / write / decide>
+StandingAuth: <actions already authorized for this executor, or none>
 HumanGate: <none | list of actions needing human approval>
+RunLocation: <where the executor runs — session / project / host class>
 Deliverable: <exact artifact expected back, format and location>
+Evidence: <where evidence must be written>
 Deadline: <optional>
 
 ## Task

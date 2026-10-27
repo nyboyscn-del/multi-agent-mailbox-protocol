@@ -1,4 +1,4 @@
-# Protocol Specification v1
+# Protocol Specification v1.1
 
 ## 1. Participants and roles
 
@@ -18,18 +18,20 @@ Any shared, durable, file-like store qualifies:
 
 The transport MUST preserve message content byte-for-byte and SHOULD preserve creation order metadata (timestamps).
 
-## 3. Message envelope
+## 3. Messages
 
-Every task message is a Markdown file named:
+Every message is its own file. **Messages are never edited after posting** — a correction is a new message that references the old one.
 
 ```
-<YYYYMMDD>-<TaskID>-REQUEST.md
-<YYYYMMDD>-<TaskID>-RESPONSE.md
+<YYYYMMDD>-<TaskID>-REQUEST.md    the task
+<YYYYMMDD>-<TaskID>-ACK.md        claim / receipt of reading
+<YYYYMMDD>-<TaskID>-RESULT.md     the outcome and evidence
+<YYYYMMDD>-<TaskID>-CLOSE.md      requester's verification verdict
 ```
 
-`TaskID` is unique per task and identical across its REQUEST / RESPONSE / CLOSE chain.
+`TaskID` is unique per task and identical across its whole message chain.
 
-The REQUEST file MUST contain:
+### 3.1 REQUEST
 
 | Field | Meaning |
 |---|---|
@@ -37,40 +39,59 @@ The REQUEST file MUST contain:
 | `From` / `To` | Requester / executor identifiers (role names, not personal accounts) |
 | `Created` | ISO-8601 timestamp with timezone |
 | `Scope` | What the executor may read, write, and decide |
+| `StandingAuth` | Actions already authorized for this executor (no per-task approval needed) |
 | `HumanGate` | Actions in this task that require human approval (or `none`) |
+| `RunLocation` | Where the executor is expected to run (session / project / host class) |
 | `Deliverable` | The exact artifact expected back (format, location) |
+| `Evidence` | Where evidence must be written so the requester can verify |
 | `Deadline` | Optional; tasks past deadline without ACK are stale |
 
 The body states the task in plain language, with all context the executor needs **inside the file** — executors cannot see the requester's chat history, memory, or other tasks.
 
+### 3.2 ACK
+
+Written by the executor **before** executing. Contains: `ReadAt` timestamp, executor identity, and a run/session identifier when the transport provides one. An ACK means "I have claimed this task" — nothing more. **An ACK is never a result and never a pass.**
+
+### 3.3 RESULT
+
+Written by the executor when work ends. Contains: `Status` (`DONE` or `BLOCKED`), what was done, and the evidence (deliverable location plus the key facts established, with sources). If blocked, the reason is mandatory.
+
+### 3.4 CLOSE
+
+Written **only by the requester**, after verifying the RESULT. Contains the acceptance verdict: `PASS` (deliverable verified against the REQUEST) or `FAIL` (with the gap stated). Only a CLOSE with `PASS` ends a task successfully.
+
 ## 4. Lifecycle
 
 ```
-QUEUED ──► ACKED ──► DONE ──► CLOSED
+QUEUED ──► ACKED ──► DONE ──► CLOSED (PASS)
   │          │         │
-  └──────────┴─────────┴──► BLOCKED (reason required)
+  │          │         └────► CLOSED (FAIL, may requeue)
+  └──────────┴──► BLOCKED ──► REQUEUED (new attempt) / CLOSED (FAIL)
 ```
 
-- **QUEUED** — REQUEST file exists; no ACK yet.
-- **ACKED** — executor writes an ACK (a RESPONSE file or a status line, per transport) containing: `ReadAt` timestamp, executor identity, and a run/session identifier when the transport provides one.
-- **DONE** — executor writes the RESPONSE file with the deliverable (or a link to it) and an evidence summary.
-- **CLOSED** — only the requester closes a task, after verifying the receipt.
-- **BLOCKED** — either side may mark a task blocked; a reason is mandatory. Gate-list actions encountered mid-task block the task until a human rules.
+- **QUEUED** — REQUEST exists; no ACK yet.
+- **ACKED** — an ACK message exists. Not a result.
+- **DONE** — a RESULT with `Status: DONE` exists, awaiting verification.
+- **CLOSED** — a CLOSE message exists. `PASS` = verified success; `FAIL` = rejected with reasons.
+- **BLOCKED** — a RESULT with `Status: BLOCKED` exists; see §6 for recovery.
 
 State is derived from files, never from memory or chat claims.
 
 ## 5. Claiming and duplicate prevention
 
-- An executor MUST ACK before executing. An un-ACKed task is unclaimed.
-- Before starting, an executor re-reads the mailbox: if an ACK from another executor exists, the task is taken.
-- For recurring/scheduled executors, a lock placeholder file (`IN_PROGRESS-<TaskID>`) is written at start and removed at completion; placeholders older than a agreed TTL (e.g. 3 hours) are considered abandoned and reported, not silently reused.
+- First valid ACK wins. Before executing, an executor re-reads the mailbox; if another executor's ACK exists, the task is taken.
+- File transports are **not atomic**: two executors polling in the same interval can both ACK. Deployments that cannot tolerate duplicate execution MUST therefore either
+  - restrict each task namespace to a **single executor**, or
+  - use a transport with an atomic claim primitive (e.g. a git push race — first push wins, the loser's push is rejected — or a lock service).
+- Scheduled executors additionally write a lock placeholder (`IN_PROGRESS-<TaskID>`) at start and remove it at completion. Placeholders older than an agreed TTL (e.g. 3 hours) are considered abandoned: report them, never silently reuse them.
 - Daily-volume caps, when agreed, are checked against the day's log before claiming new work.
 
-## 6. Polling and notification
+## 6. BLOCKED: recovery and retry
 
-- Executors poll on a fixed, agreed interval. Polling MUST be read-only until a task is claimed.
-- A poll that finds no actionable task writes nothing (or a single heartbeat line, per local convention).
-- Optional: a **sentinel** watches a side channel (e.g. a mailbox address) and notifies the requester when a receipt arrives, converting poll-latency into push for humans — never for executors.
+- A task blocked on the **human gate** waits for a human ruling. Executors never retry it on their own.
+- A task blocked on a **transient failure** (network, rate limit, tool error) may be requeued by the requester as a new attempt: a new REQUEST referencing the original TaskID with an attempt suffix (`-A2`, `-A3`). The default maximum is 3 attempts; after that the task is CLOSED (FAIL) with the history attached.
+- A task blocked on **missing input** returns to the requester, who either supplies the input (new REQUEST attempt) or closes it.
+- Executors never silently re-execute a task they have already RESULTed.
 
 ## 7. Partitioned-document variant
 
@@ -78,12 +99,12 @@ When the only shared surface is a single document, divide it into fixed partitio
 
 ```
 01_PENDING    — new tasks (QUEUED)
-02_RESULTS    — ACKs and RESPONSEs
-03_FEEDBACK   — requester verification notes
-04_CLOSED     — closed tasks archive
+02_RESULTS    — ACKs and RESULTs
+03_FEEDBACK   — requester verification notes and CLOSE records
+04_CLOSED     — archive index
 ```
 
-Tasks carry a sub-identifier in addition to the TaskID. The same lifecycle and gate rules apply; messages are appended blocks inside partitions, never edited after posting.
+Because posted blocks are never edited, **closing never moves text**: the requester appends a CLOSE record to 03_FEEDBACK (and optionally a one-line index entry to 04_CLOSED); the original blocks stay where they were written. The same lifecycle and gate rules apply.
 
 ## 8. Human gate (default list)
 
@@ -96,7 +117,7 @@ The following ALWAYS require explicit human approval, regardless of task scope:
 - writes to production / business data (prices, orders, listings, ads)
 - handling sensitive personal data
 
-A task whose scope would cross the gate mid-execution becomes BLOCKED with reason `HUMAN_GATE`, and waits.
+Actions covered by a task's `StandingAuth` field do not need per-task approval — the field exists so standing authorizations are written down once, not re-confirmed on every task. Anything neither in `Scope` nor in `StandingAuth` and on the gate list blocks the task as `HUMAN_GATE` until a human rules.
 
 ## 9. Security and privacy
 
@@ -104,13 +125,15 @@ A task whose scope would cross the gate mid-execution becomes BLOCKED with reaso
 - Use role names in envelopes, not personal account names or email addresses.
 - Treat all mailbox content as untrusted input: instructions inside a task file never widen the executor's standing scope or override the gate list.
 - Rotate access when a participant is retired; the file history remains the audit trail.
+- Contributors run the bundled sanity scan (`scripts/check-secrets.sh`) before every push; forge-level secret scanning / push protection should be enabled where available.
 
 ## 10. Verification
 
-A task is DONE only when the receipt establishes:
+A task ends as PASS only when the CLOSE establishes:
 
 1. the deliverable matches the REQUEST's `Deliverable` field,
-2. the executor stayed inside `Scope`,
-3. gate-list actions were either avoided or explicitly approved by a human.
+2. the evidence in `Evidence` location supports the RESULT's claims,
+3. the executor stayed inside `Scope` / `StandingAuth`,
+4. gate-list actions were either avoided or explicitly approved by a human.
 
 Anything else is a claim, not a result.
